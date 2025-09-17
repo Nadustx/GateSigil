@@ -1,4 +1,4 @@
-;; GateSigil - NFT Access Control Contract
+;; GateSigil - NFT Access Control Contract with QR Code Integration
 
 ;; Constants
 (define-constant CONTRACT_OWNER tx-sender)
@@ -12,10 +12,15 @@
 (define-constant ERR_INVALID_PARAMETERS u107)
 (define-constant ERR_MINT_FAILED u108)
 (define-constant ERR_TRANSFER_FAILED u109)
+(define-constant ERR_QR_CODE_EXPIRED u110)
+(define-constant ERR_QR_CODE_INVALID u111)
+(define-constant ERR_QR_CODE_USED u112)
+(define-constant ERR_QR_CODE_NOT_FOUND u113)
 
 ;; Data Variables
 (define-data-var last-token-id uint u0)
 (define-data-var contract-uri (string-utf8 256) u"")
+(define-data-var qr-code-validity-period uint u144) ;; 144 blocks (~24 hours)
 
 ;; Data Maps
 (define-map tokens
@@ -45,6 +50,27 @@
     token-id: uint,
     granted-at: uint,
     expires-at: (optional uint)
+  }
+)
+
+;; QR Code Maps
+(define-map qr-codes
+  { qr-hash: (buff 32) }
+  {
+    token-id: uint,
+    created-at: uint,
+    expires-at: uint,
+    used: bool,
+    realm: (string-ascii 64),
+    creator: principal
+  }
+)
+
+(define-map token-qr-usage
+  { token-id: uint }
+  { 
+    total-generated: uint,
+    last-generated: uint
   }
 )
 
@@ -104,6 +130,31 @@
   )
 )
 
+;; QR Code read-only functions
+(define-read-only (get-qr-code-info (qr-hash (buff 32)))
+  (map-get? qr-codes { qr-hash: qr-hash })
+)
+
+(define-read-only (validate-qr-code (qr-hash (buff 32)))
+  (match (map-get? qr-codes { qr-hash: qr-hash })
+    qr-data
+    (if (and 
+          (not (get used qr-data))
+          (<= stacks-block-height (get expires-at qr-data)))
+      (ok true)
+      (ok false))
+    (ok false)
+  )
+)
+
+(define-read-only (get-token-qr-stats (token-id uint))
+  (map-get? token-qr-usage { token-id: token-id })
+)
+
+(define-read-only (get-qr-validity-period)
+  (ok (var-get qr-code-validity-period))
+)
+
 ;; Private functions
 (define-private (is-valid-realm-name (realm (string-ascii 64)))
   (and (> (len realm) u0) (<= (len realm) u64))
@@ -121,6 +172,14 @@
   (match exp
     exp-val (> exp-val stacks-block-height)
     true)
+)
+
+(define-private (is-valid-token-id (token-id uint))
+  (and (> token-id u0) (<= token-id (var-get last-token-id)))
+)
+
+(define-private (is-valid-qr-hash (qr-hash (buff 32)))
+  (is-eq (len qr-hash) u32)
 )
 
 ;; Public functions
@@ -186,6 +245,15 @@
       }
     )
     
+    ;; Initialize QR usage stats
+    (map-set token-qr-usage
+      { token-id: token-id }
+      {
+        total-generated: u0,
+        last-generated: u0
+      }
+    )
+    
     ;; Update last token ID
     (var-set last-token-id token-id)
     (ok token-id)
@@ -196,7 +264,7 @@
   (let ((token-owner (unwrap! (nft-get-owner? gate-sigil token-id) (err ERR_TOKEN_NOT_FOUND)))
         (token-data (unwrap! (map-get? tokens { token-id: token-id }) (err ERR_TOKEN_NOT_FOUND))))
     ;; Validate inputs
-    (asserts! (> token-id u0) (err ERR_INVALID_PARAMETERS))
+    (asserts! (is-valid-token-id token-id) (err ERR_INVALID_PARAMETERS))
     (asserts! (validate-principal sender) (err ERR_INVALID_PARAMETERS))
     (asserts! (validate-principal recipient) (err ERR_INVALID_PARAMETERS))
     
@@ -241,7 +309,7 @@
         (realm (get realm token-data))
         (realm-data (unwrap! (map-get? realms { realm: realm }) (err ERR_TOKEN_NOT_FOUND))))
     ;; Validate inputs
-    (asserts! (> token-id u0) (err ERR_INVALID_PARAMETERS))
+    (asserts! (is-valid-token-id token-id) (err ERR_INVALID_PARAMETERS))
     
     ;; Check authorization
     (asserts! (or (is-eq tx-sender CONTRACT_OWNER) 
@@ -259,6 +327,91 @@
       }
     )
     (ok true)
+  )
+)
+
+;; QR Code Generation and Validation Functions
+(define-public (generate-qr-code (token-id uint) (qr-hash (buff 32)))
+  (let ((token-data (unwrap! (map-get? tokens { token-id: token-id }) (err ERR_TOKEN_NOT_FOUND)))
+        (token-owner (unwrap! (nft-get-owner? gate-sigil token-id) (err ERR_TOKEN_NOT_FOUND)))
+        (current-stats (default-to { total-generated: u0, last-generated: u0 } 
+                                  (map-get? token-qr-usage { token-id: token-id }))))
+    ;; Validate inputs
+    (asserts! (is-valid-token-id token-id) (err ERR_INVALID_PARAMETERS))
+    (asserts! (is-valid-qr-hash qr-hash) (err ERR_INVALID_PARAMETERS))
+    
+    ;; Check if token is active and not expired
+    (asserts! (get active token-data) (err ERR_TOKEN_EXPIRED))
+    (match (get expiration token-data)
+      exp-block (asserts! (<= stacks-block-height exp-block) (err ERR_TOKEN_EXPIRED))
+      true)
+    
+    ;; Check authorization - only token owner can generate QR codes
+    (asserts! (is-eq tx-sender token-owner) (err ERR_NOT_TOKEN_OWNER))
+    
+    ;; Check if QR code already exists
+    (asserts! (is-none (map-get? qr-codes { qr-hash: qr-hash })) (err ERR_ALREADY_EXISTS))
+    
+    ;; Create QR code entry
+    (let ((expires-at (+ stacks-block-height (var-get qr-code-validity-period))))
+      (map-set qr-codes
+        { qr-hash: qr-hash }
+        {
+          token-id: token-id,
+          created-at: stacks-block-height,
+          expires-at: expires-at,
+          used: false,
+          realm: (get realm token-data),
+          creator: tx-sender
+        }
+      )
+      
+      ;; Update usage stats
+      (map-set token-qr-usage
+        { token-id: token-id }
+        {
+          total-generated: (+ (get total-generated current-stats) u1),
+          last-generated: stacks-block-height
+        }
+      )
+      
+      (ok expires-at)
+    )
+  )
+)
+
+(define-public (verify-and-use-qr-code (qr-hash (buff 32)) (realm (string-ascii 64)))
+  (let ((qr-data (unwrap! (map-get? qr-codes { qr-hash: qr-hash }) (err ERR_QR_CODE_NOT_FOUND)))
+        (token-data (unwrap! (map-get? tokens { token-id: (get token-id qr-data) }) (err ERR_TOKEN_NOT_FOUND))))
+    ;; Validate inputs
+    (asserts! (is-valid-qr-hash qr-hash) (err ERR_INVALID_PARAMETERS))
+    (asserts! (is-valid-realm-name realm) (err ERR_INVALID_PARAMETERS))
+    
+    ;; Check if QR code is valid
+    (asserts! (not (get used qr-data)) (err ERR_QR_CODE_USED))
+    (asserts! (<= stacks-block-height (get expires-at qr-data)) (err ERR_QR_CODE_EXPIRED))
+    (asserts! (is-eq realm (get realm qr-data)) (err ERR_QR_CODE_INVALID))
+    
+    ;; Check if underlying token is still valid
+    (asserts! (get active token-data) (err ERR_TOKEN_EXPIRED))
+    (match (get expiration token-data)
+      exp-block (asserts! (<= stacks-block-height exp-block) (err ERR_TOKEN_EXPIRED))
+      true)
+    
+    ;; Mark QR code as used
+    (map-set qr-codes
+      { qr-hash: qr-hash }
+      {
+        token-id: (get token-id qr-data),
+        created-at: (get created-at qr-data),
+        expires-at: (get expires-at qr-data),
+        used: true,
+        realm: (get realm qr-data),
+        creator: (get creator qr-data)
+      }
+    )
+    
+    (ok (get token-id qr-data))
   )
 )
 
@@ -314,6 +467,15 @@
           }
         )
         
+        ;; Initialize QR usage stats
+        (map-set token-qr-usage
+          { token-id: token-id }
+          {
+            total-generated: u0,
+            last-generated: u0
+          }
+        )
+        
         ;; Update last token ID
         (var-set last-token-id token-id)
         
@@ -337,11 +499,21 @@
   )
 )
 
+;; Admin functions
 (define-public (set-contract-uri (uri (string-utf8 256)))
   (begin
     (asserts! (is-eq tx-sender CONTRACT_OWNER) (err ERR_OWNER_ONLY))
     (asserts! (is-valid-uri uri) (err ERR_INVALID_PARAMETERS))
     (var-set contract-uri uri)
+    (ok true)
+  )
+)
+
+(define-public (set-qr-validity-period (blocks uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) (err ERR_OWNER_ONLY))
+    (asserts! (and (> blocks u0) (<= blocks u4320)) (err ERR_INVALID_PARAMETERS)) ;; Max 30 days
+    (var-set qr-code-validity-period blocks)
     (ok true)
   )
 )
